@@ -5,11 +5,12 @@ import { buildFfmpegArgs } from '../lib/render.mjs'
 const settings = { width:720,height:1280,videoY:400,videoHeight:760,cropX:50,cropY:50,fitMode:'cover',keepAudio:true,volume:100,start:0,end:null,quality:'recommended' }
 
 test('CPU native uses libx264 ultrafast and 720x1280 composition', () => {
-  const args = buildFfmpegArgs({ source:'in.mp4', template:'template.png', output:'out.mp4', settings, encoder:'libx264' })
+  const args = buildFfmpegArgs({ source:'in.mp4', template:'template.png', output:'out.mp4', settings, encoder:'libx264', threads:2 })
   const joined = args.join(' ')
   assert.match(joined, /-c:v libx264/)
   assert.match(joined, /-preset ultrafast/)
-  assert.match(joined, /scale=652:760/)
+  assert.match(joined, /-threads 2/)
+  assert.match(joined, /fps=30,scale=652:760/)
   assert.match(joined, /overlay=34:400/)
   assert.match(joined, /-c:a aac/)
 })
@@ -19,4 +20,13 @@ test('GPU mode switches to NVENC p1', () => {
   const joined = args.join(' ')
   assert.match(joined, /-c:v h264_nvenc/)
   assert.match(joined, /-preset p1/)
+})
+
+
+test('safe mode força 1 thread de encoder e filtros', () => {
+  const args = buildFfmpegArgs({ source:'in.mp4', template:'template.png', output:'out.mp4', settings, encoder:'libx264', threads:4, safeMode:true })
+  const joined = args.join(' ')
+  assert.match(joined, /-filter_threads 1/)
+  assert.match(joined, /-filter_complex_threads 1/)
+  assert.match(joined, /-threads 1/)
 })

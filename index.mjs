@@ -7,13 +7,17 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { createClient } from '@supabase/supabase-js'
-import { detectEncoder, renderNative } from './lib/render.mjs'
+import { detectEncoder, probeVideo, renderNative } from './lib/render.mjs'
 import { claimRenderJobs, requeueStaleJobs } from './lib/queue.mjs'
+import { computeWorkerLimits, memoryPressure } from './lib/resources.mjs'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || ''
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || ''
 const BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'instagram-media'
-const CONCURRENCY = Math.max(1, Math.min(16, Number(process.env.RENDER_CONCURRENCY || 4)))
+const LIMITS = computeWorkerLimits({ requestedConcurrency: Number(process.env.RENDER_CONCURRENCY || 4), requestedThreads: Number(process.env.FFMPEG_THREADS || 0) })
+const REQUESTED_CONCURRENCY = LIMITS.requestedConcurrency
+let concurrency = LIMITS.concurrency
+const FFMPEG_THREADS = LIMITS.threads
 const POLL_MS = Math.max(500, Number(process.env.RENDER_POLL_MS || 1500))
 const DELETE_SOURCES = (process.env.DELETE_RENDER_SOURCES || 'true') === 'true'
 const PORT = Number(process.env.PORT || 8080)
@@ -31,6 +35,7 @@ let completed = 0
 let failed = 0
 let lastError = null
 let encoder = 'detecting'
+let memoryPauses = 0
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
 function cleanBase(name) { return name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9._-]+/g, '-').slice(-90) || 'video' }
@@ -81,17 +86,23 @@ async function processJob(job) {
     console.log(`[${job.id}] baixando ${job.original_name}`)
     await Promise.all([downloadObject(job.source_path, source), downloadObject(job.template_path, template)])
     const sourceStat = await stat(source)
-    console.log(`[${job.id}] render native (${(sourceStat.size / 1024 / 1024).toFixed(1)} MB) encoder=${encoder}`)
+    const probe = await probeVideo(source)
+    const retryNumber = Math.max(0, Number(job.attempts || 0) - 1)
+    const safeMode = retryNumber > 0
+    const videoInfo = probe.ok
+      ? `${probe.codec || '?'} ${probe.width || '?'}x${probe.height || '?'} fps=${probe.avgFrameRate || probe.realFrameRate || '?'} dur=${probe.duration ? probe.duration.toFixed(1) : '?'}s`
+      : `ffprobe indisponível: ${probe.error}`
+    console.log(`[${job.id}] render native (${(sourceStat.size / 1024 / 1024).toFixed(1)} MB) encoder=${encoder} safe=${safeMode} | ${videoInfo}`)
     let result
     try {
-      result = await renderNative({ source, template, output, settings: job.render_settings, encoder })
+      result = await renderNative({ source, template, output, settings: job.render_settings, encoder, threads: FFMPEG_THREADS, safeMode })
     } catch (renderError) {
       if (encoder === 'h264_nvenc') {
-        console.warn(`[${job.id}] NVENC falhou; fallback imediato para libx264`)
-        result = await renderNative({ source, template, output, settings: job.render_settings, encoder: 'libx264' })
+        console.warn(`[${job.id}] NVENC falhou; fallback imediato para libx264 em modo seguro`)
+        result = await renderNative({ source, template, output, settings: job.render_settings, encoder: 'libx264', threads: 1, safeMode: true })
       } else throw renderError
     }
-    console.log(`[${job.id}] render ok ${(result.elapsedMs / 1000).toFixed(1)}s encoder=${result.encoder}; enviando saída`)
+    console.log(`[${job.id}] render ok ${(result.elapsedMs / 1000).toFixed(1)}s encoder=${result.encoder} threads=${result.threads} safe=${result.safeMode}; enviando saída`)
     await uploadOutput(outputPath, output)
 
     const postRow = {
@@ -123,6 +134,13 @@ async function processJob(job) {
     completed++
     console.log(`[${job.id}] COMPLETO -> fila Instagram`)
   } catch (error) {
+    const signal = error?.ffmpegSignal || null
+    const interrupted = Boolean(error?.ffmpegInterrupted) || error?.ffmpegCode === null || signal === 'SIGKILL'
+    if (interrupted) {
+      const before = concurrency
+      concurrency = Math.max(1, concurrency - 1)
+      console.warn(`[${job.id}] FFmpeg interrompido (${signal || 'código null'}). Paralelismo ${before} -> ${concurrency}; próxima tentativa usará modo seguro (1 thread).`)
+    }
     console.error(`[${job.id}] ERRO`, error)
     await failJob(job, error)
   } finally {
@@ -133,15 +151,27 @@ async function processJob(job) {
 }
 
 async function claimJobs() {
-  const free = Math.max(0, CONCURRENCY - active)
+  const free = Math.max(0, concurrency - active)
   if (!free) return []
+
+  // Não inicia novos FFmpegs quando o container já está próximo do limite de RAM.
+  // Jobs em andamento continuam; o worker apenas espera a pressão cair.
+  const pressure = memoryPressure({ limitMb: LIMITS.memoryMb })
+  if (pressure.high && active > 0) {
+    memoryPauses++
+    if (memoryPauses === 1 || memoryPauses % 20 === 0) {
+      console.warn(`RAM alta ${pressure.usageMb}/${pressure.limitMb}MB; pausando novos claims (ativos=${active})`)
+    }
+    return []
+  }
+  memoryPauses = 0
   return claimRenderJobs(sb, WORKER_ID, free)
 }
 
 async function loop() {
   try {
     encoder = await detectEncoder(process.env.FFMPEG_ENCODER || 'auto')
-    console.log(`R31 Native Worker ${WORKER_ID} | concurrency=${CONCURRENCY} | encoder=${encoder}`)
+    console.log(`R31 Native Worker ${WORKER_ID} | requested=${REQUESTED_CONCURRENCY} | concurrency=${concurrency} | ffmpegThreads=${FFMPEG_THREADS} | cpu=${LIMITS.cpuCount} | mem=${LIMITS.memoryMb}MB | encoder=${encoder}`)
     const stale = await requeueStaleJobs(sb)
     if (!stale.ok) console.warn('Aviso ao re-enfileirar jobs antigos:', stale.error?.message || stale.error)
     else if (stale.count > 0) console.log(`Re-enfileirados ${stale.count} job(s) antigo(s)`)
@@ -165,7 +195,8 @@ async function loop() {
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ ok: true, workerId: WORKER_ID, encoder, concurrency: CONCURRENCY, active, completed, failed, lastError }))
+    const pressure = memoryPressure({ limitMb: LIMITS.memoryMb })
+    res.end(JSON.stringify({ ok: true, workerId: WORKER_ID, encoder, requestedConcurrency: REQUESTED_CONCURRENCY, concurrency, ffmpegThreads: FFMPEG_THREADS, cpuCount: LIMITS.cpuCount, memoryMb: LIMITS.memoryMb, memoryUsageMb: pressure.usageMb, memoryHigh: pressure.high, active, completed, failed, lastError }))
     return
   }
   res.writeHead(404).end('not found')

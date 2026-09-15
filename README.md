@@ -1,28 +1,35 @@
-# R31 Native Render Worker v3.0.2
+# R31 Native Render Worker v3.0.4
 
-Hotfix testado para Railway.
+Hotfix para falhas intermitentes `ffmpeg saiu com código null` em lotes grandes.
 
-## Corrigido
-- Node.js 22 (WebSocket nativo para Supabase).
-- Remove uso inválido de `.catch()` em `sb.rpc()`; o builder do PostgREST é thenable e não implementa `.catch()`.
-- Requeue de jobs antigos agora é tolerante a erro e não derruba o worker.
-- Limpeza de arquivos do Storage não derruba jobs concluídos.
-- `mkdtemp`/limpeza temporária protegidos para não prender contador de concorrência.
+## O que mudou
 
-## Variáveis Railway
-- `SUPABASE_URL`
-- `SUPABASE_SECRET_KEY`
-- `SUPABASE_STORAGE_BUCKET=instagram-media`
-- `RENDER_CONCURRENCY=4`
-- `RENDER_POLL_MS=1500`
-- `DELETE_RENDER_SOURCES=true`
-- `FFMPEG_ENCODER=auto`
+- qualquer saída `code === null` agora é tratada como interrupção recuperável;
+- reduz o paralelismo automaticamente após interrupção;
+- retries passam a usar **modo seguro** (1 thread de encoder + 1 thread de filtros);
+- o pipeline reduz o vídeo para **30 fps antes de scale/crop/overlay**, evitando processar 60/120 fps sem necessidade;
+- monitora RAM do cgroup e para de pegar novos jobs quando o container está acima de ~82% de uso;
+- adiciona `ffprobe` para registrar codec, resolução, fps e duração dos vídeos problemáticos;
+- health endpoint agora mostra uso atual de memória;
+- mantém H.264 + AAC e o mesmo layout/qualidade do projeto.
 
-## Logs esperados
-`R31 Native Worker ... | concurrency=4 | encoder=libx264`
-Depois: `baixando ...`, `render native ...`, `render ok ...`, `COMPLETO -> fila Instagram`.
+## Railway
 
-## v3.0.2 — RPC + testes de integração
-Corrige `TypeError: sb.rpc(...).catch is not a function`. O PostgREST builder do Supabase é `thenable`, mas não implementa `.catch()` diretamente. A chamada agora usa `await` e trata `{ data, error }` corretamente.
+Mantenha as mesmas variáveis:
 
-Também inclui graceful shutdown e testes de integração do fluxo completo do worker.
+```env
+SUPABASE_URL=...
+SUPABASE_SECRET_KEY=...
+SUPABASE_STORAGE_BUCKET=instagram-media
+RENDER_CONCURRENCY=4
+RENDER_POLL_MS=1500
+DELETE_RENDER_SOURCES=true
+FFMPEG_ENCODER=auto
+FFMPEG_THREADS=0
+```
+
+`RENDER_CONCURRENCY=4` é apenas o teto. O worker reduz sozinho quando necessário.
+
+## Atualização
+
+Substitua o conteúdo do repositório do worker por esta versão e faça commit/push. Não precisa alterar Vercel, Supabase ou SQL.
