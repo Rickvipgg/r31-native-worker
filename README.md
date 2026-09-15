@@ -1,36 +1,28 @@
-# R31 Native Render Worker
+# R31 Native Render Worker v3.0.2
 
-Esse serviço é o motor pesado da v3. Ele NÃO roda na Vercel. A Vercel continua com o painel/API; o worker roda num serviço Docker contínuo (Railway, Render, VPS, etc.).
+Hotfix testado para Railway.
 
-## O que ele faz
+## Corrigido
+- Node.js 22 (WebSocket nativo para Supabase).
+- Remove uso inválido de `.catch()` em `sb.rpc()`; o builder do PostgREST é thenable e não implementa `.catch()`.
+- Requeue de jobs antigos agora é tolerante a erro e não derruba o worker.
+- Limpeza de arquivos do Storage não derruba jobs concluídos.
+- `mkdtemp`/limpeza temporária protegidos para não prender contador de concorrência.
 
-1. Busca `render_jobs` no Supabase com claim atômico.
-2. Baixa o vídeo original + template PNG.
-3. Renderiza com FFmpeg NATIVO (`libx264 ultrafast`).
-4. Se detectar NVIDIA, usa `h264_nvenc` automaticamente.
-5. Envia o MP4 final ao Storage.
-6. Cria o `scheduled_post` para o AutoPost.
-7. Apaga fonte/template do Storage após sucesso (configurável).
-
-## Railway / serviço Docker
-
-Crie um serviço apontando para este repositório/ZIP e use o Dockerfile `worker/Dockerfile`.
-
-Variáveis do worker:
-
+## Variáveis Railway
 - `SUPABASE_URL`
 - `SUPABASE_SECRET_KEY`
 - `SUPABASE_STORAGE_BUCKET=instagram-media`
-- `RENDER_CONCURRENCY=2` a `8`, conforme CPU
-- `FFMPEG_ENCODER=auto`
+- `RENDER_CONCURRENCY=4`
+- `RENDER_POLL_MS=1500`
 - `DELETE_RENDER_SOURCES=true`
+- `FFMPEG_ENCODER=auto`
 
-O worker expõe `/health` na porta fornecida por `PORT`.
+## Logs esperados
+`R31 Native Worker ... | concurrency=4 | encoder=libx264`
+Depois: `baixando ...`, `render native ...`, `render ok ...`, `COMPLETO -> fila Instagram`.
 
-## Escala
+## v3.0.2 — RPC + testes de integração
+Corrige `TypeError: sb.rpc(...).catch is not a function`. O PostgREST builder do Supabase é `thenable`, mas não implementa `.catch()` diretamente. A chamada agora usa `await` e trata `{ data, error }` corretamente.
 
-Você pode subir 2+ workers. `claim_render_jobs()` usa `FOR UPDATE SKIP LOCKED`, então cada job é pego apenas por um worker.
-
-
-## v3.0.1 Railway WebSocket fix
-O worker agora usa Node.js 22 no Docker, que fornece WebSocket nativo exigido pelo `@supabase/realtime-js`. Isso corrige o erro `Node.js 20 detected without native WebSocket support`.
+Também inclui graceful shutdown e testes de integração do fluxo completo do worker.

@@ -8,6 +8,7 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { createClient } from '@supabase/supabase-js'
 import { detectEncoder, renderNative } from './lib/render.mjs'
+import { claimRenderJobs, requeueStaleJobs } from './lib/queue.mjs'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || ''
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || ''
@@ -69,13 +70,14 @@ async function failJob(job, error) {
 
 async function processJob(job) {
   active++
-  const tmp = await mkdtemp(path.join(os.tmpdir(), 'r31-render-'))
-  const sourceExt = path.extname(job.source_path) || '.mp4'
-  const source = path.join(tmp, `source${sourceExt}`)
-  const template = path.join(tmp, 'template.png')
-  const output = path.join(tmp, 'output.mp4')
-  const outputPath = `rendered/${new Date().toISOString().slice(0, 10)}/${job.id}-${cleanBase(job.original_name)}.mp4`
+  let tmp = null
   try {
+    tmp = await mkdtemp(path.join(os.tmpdir(), 'r31-render-'))
+    const sourceExt = path.extname(job.source_path) || '.mp4'
+    const source = path.join(tmp, `source${sourceExt}`)
+    const template = path.join(tmp, 'template.png')
+    const output = path.join(tmp, 'output.mp4')
+    const outputPath = `rendered/${new Date().toISOString().slice(0, 10)}/${job.id}-${cleanBase(job.original_name)}.mp4`
     console.log(`[${job.id}] baixando ${job.original_name}`)
     await Promise.all([downloadObject(job.source_path, source), downloadObject(job.template_path, template)])
     const sourceStat = await stat(source)
@@ -111,7 +113,12 @@ async function processJob(job) {
       locked_at: null, error: null,
     })
     if (DELETE_SOURCES) {
-      await sb.storage.from(BUCKET).remove([job.source_path, job.template_path]).catch(() => {})
+      try {
+        const { error: removeError } = await sb.storage.from(BUCKET).remove([job.source_path, job.template_path])
+        if (removeError) console.warn(`[${job.id}] aviso ao apagar fontes:`, removeError.message || removeError)
+      } catch (removeError) {
+        console.warn(`[${job.id}] aviso ao apagar fontes:`, removeError)
+      }
     }
     completed++
     console.log(`[${job.id}] COMPLETO -> fila Instagram`)
@@ -120,23 +127,24 @@ async function processJob(job) {
     await failJob(job, error)
   } finally {
     active--
-    await rm(tmp, { recursive: true, force: true }).catch(() => {})
+    if (tmp) await rm(tmp, { recursive: true, force: true }).catch(() => {})
+    if (stopping && active === 0) process.exit(0)
   }
 }
 
 async function claimJobs() {
   const free = Math.max(0, CONCURRENCY - active)
   if (!free) return []
-  const { data, error } = await sb.rpc('claim_render_jobs', { p_worker_id: WORKER_ID, p_limit: free })
-  if (error) throw error
-  return data || []
+  return claimRenderJobs(sb, WORKER_ID, free)
 }
 
 async function loop() {
   try {
     encoder = await detectEncoder(process.env.FFMPEG_ENCODER || 'auto')
     console.log(`R31 Native Worker ${WORKER_ID} | concurrency=${CONCURRENCY} | encoder=${encoder}`)
-    await sb.rpc('requeue_stale_render_jobs').catch(() => {})
+    const stale = await requeueStaleJobs(sb)
+    if (!stale.ok) console.warn('Aviso ao re-enfileirar jobs antigos:', stale.error?.message || stale.error)
+    else if (stale.count > 0) console.log(`Re-enfileirados ${stale.count} job(s) antigo(s)`)
     while (!stopping) {
       try {
         const jobs = await claimJobs()
@@ -154,15 +162,37 @@ async function loop() {
   }
 }
 
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ ok: true, workerId: WORKER_ID, encoder, concurrency: CONCURRENCY, active, completed, failed, lastError }))
     return
   }
   res.writeHead(404).end('not found')
-}).listen(PORT, '0.0.0.0', () => console.log(`health :${PORT}/health`))
+})
+server.listen(PORT, '0.0.0.0', () => console.log(`health :${PORT}/health`))
 
-process.on('SIGTERM', () => { stopping = true })
-process.on('SIGINT', () => { stopping = true })
+async function shutdown(signal) {
+  if (stopping) return
+  stopping = true
+  console.log(`${signal}: encerrando worker; jobs ativos=${active}`)
+  server.close(() => {
+    if (active === 0) process.exit(0)
+  })
+  setTimeout(() => {
+    console.warn('Encerramento forçado após 30s')
+    process.exit(0)
+  }, 30000).unref()
+}
+
+process.on('unhandledRejection', (error) => {
+  lastError = error instanceof Error ? error.message : String(error)
+  console.error('unhandledRejection:', error)
+})
+process.on('uncaughtException', (error) => {
+  lastError = error instanceof Error ? error.message : String(error)
+  console.error('uncaughtException:', error)
+})
+process.on('SIGTERM', () => { void shutdown('SIGTERM') })
+process.on('SIGINT', () => { void shutdown('SIGINT') })
 void loop()
