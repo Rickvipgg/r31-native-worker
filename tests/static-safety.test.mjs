@@ -19,3 +19,11 @@ test('worker trata SIGTERM com fechamento do servidor', async () => {
   assert.match(source, /server\.close\(/)
   assert.match(source, /process\.on\('SIGTERM'/)
 })
+
+
+test('worker v4 reutiliza o mesmo output para a fila Facebook', async () => {
+  const source = await readFile(new URL('../index.mjs', import.meta.url), 'utf8')
+  assert.match(source, /fb_pages/)
+  assert.match(source, /facebook_posts/)
+  assert.match(source, /storage_path: outputPath/)
+})

@@ -1,21 +1,33 @@
-# R31 Native Render Worker v3.0.4
+# R31 Native Render Worker v4
 
-Hotfix para falhas intermitentes `ffmpeg saiu com código null` em lotes grandes.
+Worker Railway/Docker com FFmpeg nativo adaptativo.
 
-## O que mudou
+Além das correções de estabilidade da v3.0.4, a v4 reaproveita o mesmo MP4 final para as duas plataformas:
 
-- qualquer saída `code === null` agora é tratada como interrupção recuperável;
-- reduz o paralelismo automaticamente após interrupção;
-- retries passam a usar **modo seguro** (1 thread de encoder + 1 thread de filtros);
-- o pipeline reduz o vídeo para **30 fps antes de scale/crop/overlay**, evitando processar 60/120 fps sem necessidade;
-- monitora RAM do cgroup e para de pegar novos jobs quando o container está acima de ~82% de uso;
-- adiciona `ffprobe` para registrar codec, resolução, fps e duração dos vídeos problemáticos;
-- health endpoint agora mostra uso atual de memória;
-- mantém H.264 + AAC e o mesmo layout/qualidade do projeto.
+```text
+FFmpeg nativo
+    ↓
+rendered/...mp4
+    ↓
+ ┌───────────────┐
+ ↓               ↓
+scheduled_posts facebook_posts
+Instagram        Facebook
+```
+
+O worker **não usa App Secret nem token Meta**. Ele apenas cria as filas no Supabase. A Vercel faz a publicação.
+
+## Estabilidade
+
+- `code === null` tratado como interrupção recuperável;
+- redução automática de concorrência quando um FFmpeg é morto;
+- retry em modo seguro com 1 thread;
+- normalização para 30 fps antes de filtros;
+- monitora memória do cgroup;
+- `ffprobe` para diagnóstico;
+- H.264 + AAC.
 
 ## Railway
-
-Mantenha as mesmas variáveis:
 
 ```env
 SUPABASE_URL=...
@@ -28,8 +40,10 @@ FFMPEG_ENCODER=auto
 FFMPEG_THREADS=0
 ```
 
-`RENDER_CONCURRENCY=4` é apenas o teto. O worker reduz sozinho quando necessário.
+`RENDER_CONCURRENCY=4` é o teto; o worker reduz sozinho se faltar RAM/CPU.
 
-## Atualização
+## Facebook
 
-Substitua o conteúdo do repositório do worker por esta versão e faça commit/push. Não precisa alterar Vercel, Supabase ou SQL.
+Se `fb_pages` existir e houver uma Página com `is_active=true`, cada render concluído cria também um registro em `facebook_posts` usando o **mesmo `outputPath`**.
+
+Se a migration do Facebook ainda não tiver sido executada, o worker continua funcionando normalmente só para Instagram.

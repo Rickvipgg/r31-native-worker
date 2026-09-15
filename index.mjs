@@ -116,8 +116,34 @@ async function processJob(job) {
       render_job_id: job.id,
       updated_at: new Date().toISOString(),
     }
-    const { error: postError } = await sb.from('scheduled_posts').upsert(postRow, { onConflict: 'render_job_id' })
+    const { data: igPost, error: postError } = await sb.from('scheduled_posts').upsert(postRow, { onConflict: 'render_job_id' }).select('id').single()
     if (postError) throw postError
+
+    let facebookQueued = false
+    try {
+      const { data: fbPage, error: fbPageError } = await sb.from('fb_pages').select('id').eq('is_active', true).limit(1).maybeSingle()
+      if (fbPageError) {
+        if (!String(fbPageError.message || '').includes('fb_pages')) console.warn(`[${job.id}] Facebook:`, fbPageError.message || fbPageError)
+      } else if (fbPage?.id) {
+        const fbRow = {
+          page_id: fbPage.id,
+          source_post_id: igPost.id,
+          render_job_id: job.id,
+          storage_path: outputPath,
+          original_name: postRow.original_name,
+          caption: postRow.caption,
+          scheduled_at: postRow.scheduled_at,
+          status: 'scheduled',
+          updated_at: new Date().toISOString(),
+        }
+        const { error: fbPostError } = await sb.from('facebook_posts').upsert(fbRow, { onConflict: 'page_id,render_job_id', ignoreDuplicates: true })
+        if (fbPostError) {
+          if (!String(fbPostError.message || '').includes('facebook_posts')) console.warn(`[${job.id}] Facebook fila:`, fbPostError.message || fbPostError)
+        } else facebookQueued = true
+      }
+    } catch (fbError) {
+      console.warn(`[${job.id}] Facebook opcional não enfileirado:`, fbError?.message || fbError)
+    }
 
     await setJob(job.id, {
       status: 'completed', output_path: outputPath, completed_at: new Date().toISOString(),
@@ -132,7 +158,7 @@ async function processJob(job) {
       }
     }
     completed++
-    console.log(`[${job.id}] COMPLETO -> fila Instagram`)
+    console.log(`[${job.id}] COMPLETO -> fila Instagram${facebookQueued ? ' + Facebook' : ''}`)
   } catch (error) {
     const signal = error?.ffmpegSignal || null
     const interrupted = Boolean(error?.ffmpegInterrupted) || error?.ffmpegCode === null || signal === 'SIGKILL'
