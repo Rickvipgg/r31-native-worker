@@ -1,6 +1,6 @@
 {
   "name": "r31-native-render-worker",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,6 +11,6 @@
     "@supabase/supabase-js": "^2.57.4"
   },
   "engines": {
-    "node": "20.x"
+    "node": "22.x"
   }
 }

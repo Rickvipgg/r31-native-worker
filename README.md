@@ -30,3 +30,7 @@ O worker expõe `/health` na porta fornecida por `PORT`.
 ## Escala
 
 Você pode subir 2+ workers. `claim_render_jobs()` usa `FOR UPDATE SKIP LOCKED`, então cada job é pego apenas por um worker.
+
+
+## v3.0.1 Railway WebSocket fix
+O worker agora usa Node.js 22 no Docker, que fornece WebSocket nativo exigido pelo `@supabase/realtime-js`. Isso corrige o erro `Node.js 20 detected without native WebSocket support`.
