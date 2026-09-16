@@ -19,6 +19,7 @@ const REQUESTED_CONCURRENCY = LIMITS.requestedConcurrency
 let concurrency = LIMITS.concurrency
 const FFMPEG_THREADS = LIMITS.threads
 const POLL_MS = Math.max(500, Number(process.env.RENDER_POLL_MS || 1500))
+const CANCEL_POLL_MS = Math.max(500, Number(process.env.RENDER_CANCEL_POLL_MS || 1000))
 const DELETE_SOURCES = (process.env.DELETE_RENDER_SOURCES || 'true') === 'true'
 const PORT = Number(process.env.PORT || 8080)
 const STORAGE_SAFE_OUTPUT_MB = Math.max(10, Number(process.env.STORAGE_SAFE_OUTPUT_MB || 40))
@@ -42,10 +43,10 @@ let memoryPauses = 0
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
 function cleanBase(name) { return name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9._-]+/g, '-').slice(-90) || 'video' }
 
-async function downloadObject(storagePath, destination) {
+async function downloadObject(storagePath, destination, signal) {
   const { data, error } = await sb.storage.from(BUCKET).createSignedUrl(storagePath, 600)
   if (error || !data?.signedUrl) throw error || new Error(`Falha ao assinar download: ${storagePath}`)
-  const response = await fetch(data.signedUrl)
+  const response = await fetch(data.signedUrl, { signal })
   if (!response.ok || !response.body) throw new Error(`Download ${storagePath} falhou: ${response.status}`)
   await pipeline(Readable.fromWeb(response.body), createWriteStream(destination))
 }
@@ -63,6 +64,27 @@ async function setJob(id, patch) {
   if (error) throw error
 }
 
+async function getJobStatus(id) {
+  const { data, error } = await sb.from('render_jobs').select('status').eq('id', id).maybeSingle()
+  if (error) throw error
+  return data?.status || null
+}
+
+async function isJobCancelled(id) {
+  try { return await getJobStatus(id) === 'cancelled' } catch { return false }
+}
+
+function cancelledError() {
+  const error = new Error('Renderização cancelada pelo usuário')
+  error.cancelled = true
+  return error
+}
+
+async function assertNotCancelled(jobId, signal) {
+  if (signal?.aborted) throw cancelledError()
+  if (await isJobCancelled(jobId)) throw cancelledError()
+}
+
 async function failJob(job, error) {
   failed++
   lastError = error instanceof Error ? error.message : String(error)
@@ -78,6 +100,22 @@ async function failJob(job, error) {
 async function processJob(job) {
   active++
   let tmp = null
+  let uploadedOutputPath = null
+  const cancelController = new AbortController()
+  let cancelCheckBusy = false
+  const cancelTimer = setInterval(async () => {
+    if (cancelCheckBusy || cancelController.signal.aborted) return
+    cancelCheckBusy = true
+    try {
+      if (await isJobCancelled(job.id)) {
+        console.log(`[${job.id}] cancelamento detectado; encerrando FFmpeg…`)
+        cancelController.abort()
+      }
+    } catch (error) {
+      console.warn(`[${job.id}] aviso ao consultar cancelamento:`, error?.message || error)
+    } finally { cancelCheckBusy = false }
+  }, CANCEL_POLL_MS)
+  cancelTimer.unref?.()
   try {
     tmp = await mkdtemp(path.join(os.tmpdir(), 'r31-render-'))
     const sourceExt = path.extname(job.source_path) || '.mp4'
@@ -86,9 +124,10 @@ async function processJob(job) {
     const output = path.join(tmp, 'output.mp4')
     const outputPath = `rendered/${new Date().toISOString().slice(0, 10)}/${job.id}-${cleanBase(job.original_name)}.mp4`
     console.log(`[${job.id}] baixando ${job.original_name}`)
-    await Promise.all([downloadObject(job.source_path, source), downloadObject(job.template_path, template)])
+    await Promise.all([downloadObject(job.source_path, source, cancelController.signal), downloadObject(job.template_path, template, cancelController.signal)])
+    await assertNotCancelled(job.id, cancelController.signal)
     const sourceStat = await stat(source)
-    const probe = await probeVideo(source)
+    const probe = await probeVideo(source, { signal: cancelController.signal })
     const retryNumber = Math.max(0, Number(job.attempts || 0) - 1)
     const safeMode = retryNumber > 0
     const videoInfo = probe.ok
@@ -97,21 +136,25 @@ async function processJob(job) {
     console.log(`[${job.id}] render native (${(sourceStat.size / 1024 / 1024).toFixed(1)} MB) encoder=${encoder} safe=${safeMode} | ${videoInfo}`)
     let result
     try {
-      result = await renderNative({ source, template, output, settings: job.render_settings, encoder, threads: FFMPEG_THREADS, safeMode })
+      result = await renderNative({ source, template, output, settings: job.render_settings, encoder, threads: FFMPEG_THREADS, safeMode, signal: cancelController.signal })
     } catch (renderError) {
       if (encoder === 'h264_nvenc') {
         console.warn(`[${job.id}] NVENC falhou; fallback imediato para libx264 em modo seguro`)
-        result = await renderNative({ source, template, output, settings: job.render_settings, encoder: 'libx264', threads: 1, safeMode: true })
+        result = await renderNative({ source, template, output, settings: job.render_settings, encoder: 'libx264', threads: 1, safeMode: true, signal: cancelController.signal })
       } else throw renderError
     }
     const renderedStat = await stat(output)
     console.log(`[${job.id}] render ok ${(result.elapsedMs / 1000).toFixed(1)}s encoder=${result.encoder} threads=${result.threads} safe=${result.safeMode}; saída=${(renderedStat.size/1024/1024).toFixed(1)} MB`)
-    const sizeGuard = await ensureStorageSafeMp4({ input: output, maxBytes: STORAGE_SAFE_OUTPUT_BYTES, threads: safeMode ? 1 : Math.max(1, FFMPEG_THREADS) })
+    await assertNotCancelled(job.id, cancelController.signal)
+    const sizeGuard = await ensureStorageSafeMp4({ input: output, maxBytes: STORAGE_SAFE_OUTPUT_BYTES, threads: safeMode ? 1 : Math.max(1, FFMPEG_THREADS), signal: cancelController.signal })
     if (sizeGuard.recompressed) {
       console.log(`[${job.id}] size guard: ${(sizeGuard.originalBytes/1024/1024).toFixed(1)} MB -> ${(sizeGuard.finalBytes/1024/1024).toFixed(1)} MB em ${sizeGuard.attempts} compactação(ões)`)
     }
+    await assertNotCancelled(job.id, cancelController.signal)
     console.log(`[${job.id}] enviando saída segura (${(sizeGuard.finalBytes/1024/1024).toFixed(1)} MB; limite interno=${STORAGE_SAFE_OUTPUT_MB} MB)`)
     await uploadOutput(outputPath, output)
+    uploadedOutputPath = outputPath
+    await assertNotCancelled(job.id, cancelController.signal)
 
     const postRow = {
       account_id: job.account_id,
@@ -168,16 +211,26 @@ async function processJob(job) {
     completed++
     console.log(`[${job.id}] COMPLETO -> fila Instagram${facebookQueued ? ' + Facebook' : ''}`)
   } catch (error) {
-    const signal = error?.ffmpegSignal || null
-    const interrupted = Boolean(error?.ffmpegInterrupted) || error?.ffmpegCode === null || signal === 'SIGKILL'
-    if (interrupted) {
-      const before = concurrency
-      concurrency = Math.max(1, concurrency - 1)
-      console.warn(`[${job.id}] FFmpeg interrompido (${signal || 'código null'}). Paralelismo ${before} -> ${concurrency}; próxima tentativa usará modo seguro (1 thread).`)
+    const wasCancelled = Boolean(error?.cancelled) || cancelController.signal.aborted || await isJobCancelled(job.id)
+    if (wasCancelled) {
+      console.log(`[${job.id}] CANCELADO pelo usuário; temporários serão removidos e o job ficará disponível para tentar novamente.`)
+      if (uploadedOutputPath) {
+        await sb.storage.from(BUCKET).remove([uploadedOutputPath]).catch(() => {})
+      }
+      await setJob(job.id, { status: 'cancelled', worker_id: null, locked_at: null, output_path: null, error: 'Cancelado pelo usuário' }).catch((e) => console.error('Falha ao confirmar cancelamento', e))
+    } else {
+      const signal = error?.ffmpegSignal || null
+      const interrupted = Boolean(error?.ffmpegInterrupted) || error?.ffmpegCode === null || signal === 'SIGKILL'
+      if (interrupted) {
+        const before = concurrency
+        concurrency = Math.max(1, concurrency - 1)
+        console.warn(`[${job.id}] FFmpeg interrompido (${signal || 'código null'}). Paralelismo ${before} -> ${concurrency}; próxima tentativa usará modo seguro (1 thread).`)
+      }
+      console.error(`[${job.id}] ERRO`, error)
+      await failJob(job, error)
     }
-    console.error(`[${job.id}] ERRO`, error)
-    await failJob(job, error)
   } finally {
+    clearInterval(cancelTimer)
     active--
     if (tmp) await rm(tmp, { recursive: true, force: true }).catch(() => {})
     if (stopping && active === 0) process.exit(0)
@@ -205,7 +258,7 @@ async function claimJobs() {
 async function loop() {
   try {
     encoder = await detectEncoder(process.env.FFMPEG_ENCODER || 'auto')
-    console.log(`R31 Native Worker ${WORKER_ID} | requested=${REQUESTED_CONCURRENCY} | concurrency=${concurrency} | ffmpegThreads=${FFMPEG_THREADS} | cpu=${LIMITS.cpuCount} | mem=${LIMITS.memoryMb}MB | encoder=${encoder} | storageSafe=${STORAGE_SAFE_OUTPUT_MB}MB`)
+    console.log(`R31 Native Worker ${WORKER_ID} | requested=${REQUESTED_CONCURRENCY} | concurrency=${concurrency} | ffmpegThreads=${FFMPEG_THREADS} | cpu=${LIMITS.cpuCount} | mem=${LIMITS.memoryMb}MB | encoder=${encoder} | storageSafe=${STORAGE_SAFE_OUTPUT_MB}MB | cancelPoll=${CANCEL_POLL_MS}ms`)
     const stale = await requeueStaleJobs(sb)
     if (!stale.ok) console.warn('Aviso ao re-enfileirar jobs antigos:', stale.error?.message || stale.error)
     else if (stale.count > 0) console.log(`Re-enfileirados ${stale.count} job(s) antigo(s)`)
@@ -230,7 +283,7 @@ const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' })
     const pressure = memoryPressure({ limitMb: LIMITS.memoryMb })
-    res.end(JSON.stringify({ ok: true, workerId: WORKER_ID, encoder, requestedConcurrency: REQUESTED_CONCURRENCY, concurrency, ffmpegThreads: FFMPEG_THREADS, cpuCount: LIMITS.cpuCount, memoryMb: LIMITS.memoryMb, memoryUsageMb: pressure.usageMb, memoryHigh: pressure.high, storageSafeOutputMb: STORAGE_SAFE_OUTPUT_MB, active, completed, failed, lastError }))
+    res.end(JSON.stringify({ ok: true, workerId: WORKER_ID, encoder, requestedConcurrency: REQUESTED_CONCURRENCY, concurrency, ffmpegThreads: FFMPEG_THREADS, cpuCount: LIMITS.cpuCount, memoryMb: LIMITS.memoryMb, memoryUsageMb: pressure.usageMb, memoryHigh: pressure.high, storageSafeOutputMb: STORAGE_SAFE_OUTPUT_MB, cancelPollMs: CANCEL_POLL_MS, active, completed, failed, lastError }))
     return
   }
   res.writeHead(404).end('not found')

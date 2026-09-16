@@ -52,3 +52,7 @@ Se a migration do Facebook ainda não tiver sido executada, o worker continua fu
 ## v4.1 — proteção contra limite do Storage
 
 O worker mede o MP4 final antes de enviar. Se passar de `STORAGE_SAFE_OUTPUT_MB` (40 MB por padrão), recompõe automaticamente para 720x1280/30fps com bitrate calculado pela duração e tenta novamente até ficar abaixo do limite. Isso evita `The object exceeded the maximum allowed size` no upload do render final.
+
+
+## v4.2 — cancelamento em andamento
+O worker consulta o status do job enquanto o FFmpeg está ativo. Quando o painel muda o job para `cancelled`, o processo recebe `SIGTERM` e, se necessário, `SIGKILL` após ~1,2 s. O job não conta como erro e pode ser reenfileirado com **Agora**.
