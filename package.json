@@ -1,12 +1,12 @@
 {
   "name": "r31-native-render-worker",
-  "version": "4.2.0",
+  "version": "4.3.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node index.mjs",
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check index.mjs && node --check lib/render.mjs && node --check lib/queue.mjs && node --check lib/resources.mjs"
+    "check": "node --check index.mjs && node --check lib/render.mjs && node --check lib/queue.mjs && node --check lib/resources.mjs && node --check lib/publish-heartbeat.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.57.4"

@@ -10,6 +10,7 @@ import { createClient } from '@supabase/supabase-js'
 import { detectEncoder, probeVideo, renderNative, ensureStorageSafeMp4 } from './lib/render.mjs'
 import { claimRenderJobs, requeueStaleJobs } from './lib/queue.mjs'
 import { computeWorkerLimits, memoryPressure } from './lib/resources.mjs'
+import { triggerPublishQueue } from './lib/publish-heartbeat.mjs'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || ''
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || ''
@@ -24,6 +25,8 @@ const DELETE_SOURCES = (process.env.DELETE_RENDER_SOURCES || 'true') === 'true'
 const PORT = Number(process.env.PORT || 8080)
 const STORAGE_SAFE_OUTPUT_MB = Math.max(10, Number(process.env.STORAGE_SAFE_OUTPUT_MB || 40))
 const STORAGE_SAFE_OUTPUT_BYTES = Math.floor(STORAGE_SAFE_OUTPUT_MB * 1024 * 1024)
+const PUBLISH_QUEUE_URL = process.env.PUBLISH_QUEUE_URL || 'https://r31-studio-automadark.vercel.app/api/cron/publish'
+const PUBLISH_POLL_MS = Math.max(5000, Number(process.env.PUBLISH_POLL_MS || 15000))
 const WORKER_ID = process.env.WORKER_ID || `${os.hostname()}-${crypto.randomUUID().slice(0, 8)}`
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
@@ -37,6 +40,12 @@ let active = 0
 let completed = 0
 let failed = 0
 let lastError = null
+let publishRuns = 0
+let publishProcessed = 0
+let publishFailures = 0
+let lastPublishAt = null
+let lastPublishError = null
+let publisherBusy = false
 let encoder = 'detecting'
 let memoryPauses = 0
 
@@ -255,6 +264,33 @@ async function claimJobs() {
   return claimRenderJobs(sb, WORKER_ID, free)
 }
 
+async function publicationLoop() {
+  // The render worker is already always-on, so it also acts as the scheduler for
+  // Instagram/Facebook. This avoids depending on browser tabs or Vercel Cron plan limits.
+  while (!stopping) {
+    if (!publisherBusy) {
+      publisherBusy = true
+      try {
+        const result = await triggerPublishQueue({ url: PUBLISH_QUEUE_URL, secret: SUPABASE_KEY })
+        publishRuns++
+        publishProcessed += Number(result?.processed || 0)
+        lastPublishAt = new Date().toISOString()
+        lastPublishError = null
+        if (Number(result?.processed || 0) > 0) {
+          console.log(`publisher heartbeat: processados=${result.processed} (IG=${result?.instagram?.length || 0}, FB=${result?.facebook?.length || 0})`)
+        }
+      } catch (error) {
+        publishFailures++
+        lastPublishError = error instanceof Error ? error.message : String(error)
+        if (publishFailures <= 3 || publishFailures % 20 === 0) console.warn('publisher heartbeat:', lastPublishError)
+      } finally {
+        publisherBusy = false
+      }
+    }
+    await sleep(PUBLISH_POLL_MS)
+  }
+}
+
 async function loop() {
   try {
     encoder = await detectEncoder(process.env.FFMPEG_ENCODER || 'auto')
@@ -283,7 +319,7 @@ const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' })
     const pressure = memoryPressure({ limitMb: LIMITS.memoryMb })
-    res.end(JSON.stringify({ ok: true, workerId: WORKER_ID, encoder, requestedConcurrency: REQUESTED_CONCURRENCY, concurrency, ffmpegThreads: FFMPEG_THREADS, cpuCount: LIMITS.cpuCount, memoryMb: LIMITS.memoryMb, memoryUsageMb: pressure.usageMb, memoryHigh: pressure.high, storageSafeOutputMb: STORAGE_SAFE_OUTPUT_MB, cancelPollMs: CANCEL_POLL_MS, active, completed, failed, lastError }))
+    res.end(JSON.stringify({ ok: true, workerId: WORKER_ID, encoder, requestedConcurrency: REQUESTED_CONCURRENCY, concurrency, ffmpegThreads: FFMPEG_THREADS, cpuCount: LIMITS.cpuCount, memoryMb: LIMITS.memoryMb, memoryUsageMb: pressure.usageMb, memoryHigh: pressure.high, storageSafeOutputMb: STORAGE_SAFE_OUTPUT_MB, cancelPollMs: CANCEL_POLL_MS, publishQueueUrl: PUBLISH_QUEUE_URL, publishPollMs: PUBLISH_POLL_MS, publishRuns, publishProcessed, publishFailures, lastPublishAt, lastPublishError, active, completed, failed, lastError }))
     return
   }
   res.writeHead(404).end('not found')
@@ -314,3 +350,4 @@ process.on('uncaughtException', (error) => {
 process.on('SIGTERM', () => { void shutdown('SIGTERM') })
 process.on('SIGINT', () => { void shutdown('SIGINT') })
 void loop()
+void publicationLoop()
