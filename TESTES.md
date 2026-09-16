@@ -16,3 +16,10 @@ Executados localmente antes do empacotamento:
 - Supabase RPC thenable sem `.catch()`
 
 Observação: o ambiente de teste não possui Docker daemon, portanto o `docker build` não foi executado aqui. O Dockerfile usa Node 22 bookworm-slim + FFmpeg, e a sintaxe/arquivos foram validados.
+
+
+## v4.1 Size Guard
+
+- `npm test`: inclui teste real de recompressão automática quando o MP4 final excede o limite.
+- `npm run check`: valida sintaxe do worker e libs.
+- O teste força um MP4 acima de um limite artificial e confirma que o arquivo final fica abaixo do teto.

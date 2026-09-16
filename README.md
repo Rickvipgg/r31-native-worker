@@ -47,3 +47,8 @@ FFMPEG_THREADS=0
 Se `fb_pages` existir e houver uma Página com `is_active=true`, cada render concluído cria também um registro em `facebook_posts` usando o **mesmo `outputPath`**.
 
 Se a migration do Facebook ainda não tiver sido executada, o worker continua funcionando normalmente só para Instagram.
+
+
+## v4.1 — proteção contra limite do Storage
+
+O worker mede o MP4 final antes de enviar. Se passar de `STORAGE_SAFE_OUTPUT_MB` (40 MB por padrão), recompõe automaticamente para 720x1280/30fps com bitrate calculado pela duração e tenta novamente até ficar abaixo do limite. Isso evita `The object exceeded the maximum allowed size` no upload do render final.

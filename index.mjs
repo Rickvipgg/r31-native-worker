@@ -7,7 +7,7 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { createClient } from '@supabase/supabase-js'
-import { detectEncoder, probeVideo, renderNative } from './lib/render.mjs'
+import { detectEncoder, probeVideo, renderNative, ensureStorageSafeMp4 } from './lib/render.mjs'
 import { claimRenderJobs, requeueStaleJobs } from './lib/queue.mjs'
 import { computeWorkerLimits, memoryPressure } from './lib/resources.mjs'
 
@@ -21,6 +21,8 @@ const FFMPEG_THREADS = LIMITS.threads
 const POLL_MS = Math.max(500, Number(process.env.RENDER_POLL_MS || 1500))
 const DELETE_SOURCES = (process.env.DELETE_RENDER_SOURCES || 'true') === 'true'
 const PORT = Number(process.env.PORT || 8080)
+const STORAGE_SAFE_OUTPUT_MB = Math.max(10, Number(process.env.STORAGE_SAFE_OUTPUT_MB || 40))
+const STORAGE_SAFE_OUTPUT_BYTES = Math.floor(STORAGE_SAFE_OUTPUT_MB * 1024 * 1024)
 const WORKER_ID = process.env.WORKER_ID || `${os.hostname()}-${crypto.randomUUID().slice(0, 8)}`
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
@@ -102,7 +104,13 @@ async function processJob(job) {
         result = await renderNative({ source, template, output, settings: job.render_settings, encoder: 'libx264', threads: 1, safeMode: true })
       } else throw renderError
     }
-    console.log(`[${job.id}] render ok ${(result.elapsedMs / 1000).toFixed(1)}s encoder=${result.encoder} threads=${result.threads} safe=${result.safeMode}; enviando saída`)
+    const renderedStat = await stat(output)
+    console.log(`[${job.id}] render ok ${(result.elapsedMs / 1000).toFixed(1)}s encoder=${result.encoder} threads=${result.threads} safe=${result.safeMode}; saída=${(renderedStat.size/1024/1024).toFixed(1)} MB`)
+    const sizeGuard = await ensureStorageSafeMp4({ input: output, maxBytes: STORAGE_SAFE_OUTPUT_BYTES, threads: safeMode ? 1 : Math.max(1, FFMPEG_THREADS) })
+    if (sizeGuard.recompressed) {
+      console.log(`[${job.id}] size guard: ${(sizeGuard.originalBytes/1024/1024).toFixed(1)} MB -> ${(sizeGuard.finalBytes/1024/1024).toFixed(1)} MB em ${sizeGuard.attempts} compactação(ões)`)
+    }
+    console.log(`[${job.id}] enviando saída segura (${(sizeGuard.finalBytes/1024/1024).toFixed(1)} MB; limite interno=${STORAGE_SAFE_OUTPUT_MB} MB)`)
     await uploadOutput(outputPath, output)
 
     const postRow = {
@@ -197,7 +205,7 @@ async function claimJobs() {
 async function loop() {
   try {
     encoder = await detectEncoder(process.env.FFMPEG_ENCODER || 'auto')
-    console.log(`R31 Native Worker ${WORKER_ID} | requested=${REQUESTED_CONCURRENCY} | concurrency=${concurrency} | ffmpegThreads=${FFMPEG_THREADS} | cpu=${LIMITS.cpuCount} | mem=${LIMITS.memoryMb}MB | encoder=${encoder}`)
+    console.log(`R31 Native Worker ${WORKER_ID} | requested=${REQUESTED_CONCURRENCY} | concurrency=${concurrency} | ffmpegThreads=${FFMPEG_THREADS} | cpu=${LIMITS.cpuCount} | mem=${LIMITS.memoryMb}MB | encoder=${encoder} | storageSafe=${STORAGE_SAFE_OUTPUT_MB}MB`)
     const stale = await requeueStaleJobs(sb)
     if (!stale.ok) console.warn('Aviso ao re-enfileirar jobs antigos:', stale.error?.message || stale.error)
     else if (stale.count > 0) console.log(`Re-enfileirados ${stale.count} job(s) antigo(s)`)
@@ -222,7 +230,7 @@ const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' })
     const pressure = memoryPressure({ limitMb: LIMITS.memoryMb })
-    res.end(JSON.stringify({ ok: true, workerId: WORKER_ID, encoder, requestedConcurrency: REQUESTED_CONCURRENCY, concurrency, ffmpegThreads: FFMPEG_THREADS, cpuCount: LIMITS.cpuCount, memoryMb: LIMITS.memoryMb, memoryUsageMb: pressure.usageMb, memoryHigh: pressure.high, active, completed, failed, lastError }))
+    res.end(JSON.stringify({ ok: true, workerId: WORKER_ID, encoder, requestedConcurrency: REQUESTED_CONCURRENCY, concurrency, ffmpegThreads: FFMPEG_THREADS, cpuCount: LIMITS.cpuCount, memoryMb: LIMITS.memoryMb, memoryUsageMb: pressure.usageMb, memoryHigh: pressure.high, storageSafeOutputMb: STORAGE_SAFE_OUTPUT_MB, active, completed, failed, lastError }))
     return
   }
   res.writeHead(404).end('not found')
